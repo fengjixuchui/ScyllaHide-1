@@ -4,20 +4,17 @@
 #include <cstdio>
 #include <cstring>
 #include <Scylla/Logger.h>
-#include <Scylla/NtApiLoader.h>
 #include <Scylla/PebHider.h>
 #include <Scylla/Settings.h>
 #include <Scylla/Util.h>
 
 #include "DynamicMapping.h"
 #include "..\HookLibrary\HookMain.h"
-#include "RemoteHook.h"
 #include "ApplyHooking.h"
 #include "../PluginGeneric/Injector.h"
 
 scl::Settings g_settings;
 scl::Logger g_log;
-std::wstring g_ntApiCollectionIniPath;
 std::wstring g_scyllaHideIniPath;
 
 HOOK_DLL_DATA g_hdd;
@@ -54,7 +51,6 @@ int wmain(int argc, wchar_t* argv[])
     auto wstrPath = scl::GetModuleFileNameW();
     wstrPath.resize(wstrPath.find_last_of(L'\\') + 1);
 
-    g_ntApiCollectionIniPath = wstrPath + scl::NtApiLoader::kFileName;
     g_scyllaHideIniPath = wstrPath + scl::Settings::kFileName;
 
     auto log_file = wstrPath + scl::Logger::kFileName;
@@ -62,7 +58,7 @@ int wmain(int argc, wchar_t* argv[])
     g_log.SetLogCb(scl::Logger::Info, LogCallback);
     g_log.SetLogCb(scl::Logger::Error, LogCallback);
 
-    ReadNtApiInformation(g_ntApiCollectionIniPath.c_str(), &g_hdd);
+    ReadNtApiInformation(&g_hdd);
     SetDebugPrivileges();
     //ChangeBadWindowText();
     g_settings.Load(g_scyllaHideIniPath.c_str());
@@ -127,47 +123,75 @@ static bool StartHooking(HANDLE hProcess, BYTE * dllMemory, DWORD_PTR imageBase)
     g_hdd.dwProtectedProcessId = 0;
     g_hdd.EnableProtectProcessId = FALSE;
 
-    DWORD enableEverything = PEB_PATCH_BeingDebugged|PEB_PATCH_HeapFlags|PEB_PATCH_NtGlobalFlag|PEB_PATCH_ProcessParameters;
-    ApplyPEBPatch(hProcess, enableEverything);
+    DWORD peb_flags = 0;
+    if (g_settings.opts().fixPebBeingDebugged)
+        peb_flags |= PEB_PATCH_BeingDebugged;
+    if (g_settings.opts().fixPebHeapFlags)
+        peb_flags |= PEB_PATCH_HeapFlags;
+    if (g_settings.opts().fixPebNtGlobalFlag)
+        peb_flags |= PEB_PATCH_NtGlobalFlag;
+    if (g_settings.opts().fixPebStartupInfo)
+        peb_flags |= PEB_PATCH_ProcessParameters;
+
+    ApplyPEBPatch(hProcess, peb_flags);
+
+    if (dllMemory == nullptr || imageBase == 0)
+        return peb_flags != 0; // Not injecting hook DLL
 
     return ApplyHook(&g_hdd, hProcess, dllMemory, imageBase);
 }
 
 bool startInjectionProcess(HANDLE hProcess, BYTE * dllMemory)
 {
+    if (!NT_SUCCESS(NtSuspendProcess(hProcess)))
+        return false;
+
     if (g_settings.opts().removeDebugPrivileges)
     {
         RemoveDebugPrivileges(hProcess);
     }
 
-    LPVOID remoteImageBase = MapModuleToProcess(hProcess, dllMemory, true);
-    if (remoteImageBase)
+    const bool injectDll = g_settings.hook_dll_needed();
+    bool success = false;
+    if (injectDll)
     {
-        FillHookDllData(hProcess, &g_hdd);
-        DWORD hookDllDataAddressRva = GetDllFunctionAddressRVA(dllMemory, "HookDllData");
-
-        if (StartHooking(hProcess, dllMemory, (DWORD_PTR)remoteImageBase))
+        LPVOID remoteImageBase = MapModuleToProcess(hProcess, dllMemory, true);
+        if (remoteImageBase != nullptr)
         {
-            if (WriteProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hookDllDataAddressRva + (DWORD_PTR)remoteImageBase), &g_hdd, sizeof(HOOK_DLL_DATA), 0))
+            FillHookDllData(hProcess, &g_hdd);
+            DWORD hookDllDataAddressRva = GetDllFunctionAddressRVA(dllMemory, "HookDllData");
+
+            if (StartHooking(hProcess, dllMemory, (DWORD_PTR)remoteImageBase))
             {
-                wprintf(L"Injection successful, Imagebase %p\n", remoteImageBase);
-                return true;
-            }
-            else
-            {
-                wprintf(L"Failed to write hook dll data\n");
+                if (WriteProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hookDllDataAddressRva + (DWORD_PTR)remoteImageBase), &g_hdd, sizeof(HOOK_DLL_DATA), 0))
+                {
+                    wprintf(L"Hook injection successful, image base %p\n", remoteImageBase);
+                    success = true;
+                }
+                else
+                {
+                    wprintf(L"Failed to write hook dll data\n");
+                }
             }
         }
     }
+    else
+    {
+        if (StartHooking(hProcess, nullptr, 0))
+            wprintf(L"PEB patch successful, hook injection not needed\n");
+        success = true;
+    }
 
-    return false;
+    NtResumeProcess(hProcess);
+
+    return success;
 }
 
 bool startInjection(DWORD targetPid, const WCHAR * dllPath)
 {
     bool result = false;
 
-    HANDLE hProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+    HANDLE hProcess = OpenProcess( PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
         0, targetPid);
     if (hProcess)
     {
@@ -256,7 +280,6 @@ DWORD GetProcessIdByName(const WCHAR * processName)
 
 void ReadSettings()
 {
-    g_hdd.EnableBlockInputHook = g_settings.opts().hookBlockInput;
     g_hdd.EnableGetLocalTimeHook = g_settings.opts().hookGetLocalTime;
     g_hdd.EnableGetSystemTimeHook = g_settings.opts().hookGetSystemTime;
     g_hdd.EnableGetTickCount64Hook = g_settings.opts().hookGetTickCount64;
@@ -274,6 +297,7 @@ void ReadSettings()
     g_hdd.EnableNtSetContextThreadHook = g_settings.opts().hookNtSetContextThread;
     g_hdd.EnableNtSetDebugFilterStateHook = g_settings.opts().hookNtSetDebugFilterState;
     g_hdd.EnableNtSetInformationThreadHook = g_settings.opts().hookNtSetInformationThread;
+    g_hdd.EnableNtUserBlockInputHook = g_settings.opts().hookNtUserBlockInput;
     g_hdd.EnableNtUserBuildHwndListHook = g_settings.opts().hookNtUserBuildHwndList;
     g_hdd.EnableNtUserFindWindowExHook = g_settings.opts().hookNtUserFindWindowEx;
     g_hdd.EnableNtUserQueryWindowHook = g_settings.opts().hookNtUserQueryWindow;
@@ -286,61 +310,6 @@ void ReadSettings()
     g_hdd.EnablePreventThreadCreation = g_settings.opts().preventThreadCreation;
     g_hdd.EnableProtectProcessId = g_settings.opts().protectProcessId;
 }
-
-//BOOL CALLBACK MyEnumChildProc(
-//	_In_  HWND hwnd,
-//	_In_  LPARAM lParam
-//	)
-//{
-//	WCHAR windowText[1000] = { 0 };
-//	WCHAR classText[1000] = { 0 };
-//	if (GetWindowTextW(hwnd, windowText, _countof(windowText)) > 1)
-//	{
-//		GetClassName(hwnd, classText, _countof(classText));
-//
-//		wprintf(L"\t%s\n\t%s\n", windowText, classText);
-//	}
-//
-//	return TRUE;
-//}
-//
-//BOOL CALLBACK MyEnumWindowsProc(HWND hwnd,LPARAM lParam)
-//{
-//	WCHAR windowText[1000] = { 0 };
-//	WCHAR classText[1000] = { 0 };
-//	if (GetWindowTextW(hwnd, windowText, _countof(windowText)) > 1)
-//	{
-//		GetClassName(hwnd, classText, _countof(classText));
-//
-//		wprintf(L"------------------\n%s\n%s\n", windowText, classText);
-//
-//		if (wcsistr(windowText, L"x32_dbg"))
-//		{
-//
-//			EnumChildWindows(hwnd, MyEnumChildProc, 0);
-//
-//			DWORD_PTR result;
-//			SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, (LPARAM)title, SMTO_ABORTIFHUNG, 1000, &result);
-//
-//			//LPVOID stringW = WriteStringInProcessW(hwnd, L"ficken");
-//			//LPVOID stringA = WriteStringInProcessA(hwnd, "ficken");
-//			//if (!SetClassLongPtrW(hwnd, (int)&((WNDCLASSEXW*)0)->lpszClassName, (LONG_PTR)stringW))
-//			//{
-//			//	printf("%d %d\n", (int)&((WNDCLASSEXW*)0)->lpszClassName,  GetLastError());
-//			//}
-//			//if (!SetClassLongPtrA(hwnd, (int)&((WNDCLASSEXA*)0)->lpszClassName, (LONG_PTR)stringA))
-//			//{
-//			//	printf("%d %d\n", (int)&((WNDCLASSEXA*)0)->lpszClassName, GetLastError());
-//			//}
-//		}
-//	}
-//
-//	return TRUE;
-//}
-//void ChangeBadWindowText()
-//{
-//	EnumWindows(MyEnumWindowsProc, 0);
-//}
 
 bool convertNumber(const wchar_t* str, unsigned long & result, int radix)
 {

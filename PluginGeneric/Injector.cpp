@@ -1,7 +1,7 @@
 #include "Injector.h"
 #include <Psapi.h>
 #include "Scylla/Logger.h"
-#include <Scylla/NtApiLoader.h>
+#include <Scylla/User32Loader.h>
 #include <Scylla/OsInfo.h>
 #include <Scylla/PebHider.h>
 #include <Scylla/Settings.h>
@@ -23,37 +23,37 @@ BYTE* DbgUiIssueRemoteBreakin_addr;
 DWORD jmpback;
 DWORD DbgUiRemoteBreakin_addr;
 BYTE* RemoteBreakinPatch;
-BYTE code[8];
+BYTE OllyRemoteBreakInReplacement[8];
 HANDLE hDebuggee;
 
-void ReadNtApiInformation(const wchar_t *file, HOOK_DLL_DATA *hde)
+void ReadNtApiInformation(HOOK_DLL_DATA *hdd)
 {
-    scl::NtApiLoader api_loader;
-    auto res = api_loader.Load(file);
-    if (!res.first)
+    scl::User32Loader user32Loader;
+    if (!user32Loader.FindSyscalls({
+        "NtUserBlockInput",
+        "NtUserBuildHwndList",
+        "NtUserFindWindowEx",
+        "NtUserQueryWindow",
+        "NtUserGetClassName",
+        "NtUserInternalGetWindowText" }))
     {
-        g_log.LogError(L"Failed to load NT API addresses: %s", res.second.c_str());
+        g_log.LogError(L"Failed to find user32.dll/win32u.dll syscalls!");
         return;
     }
 
-    hde->NtUserQueryWindowRVA = (DWORD)api_loader.get_fun(L"user32.dll", L"NtUserQueryWindow");
-    hde->NtUserBuildHwndListRVA = (DWORD)api_loader.get_fun(L"user32.dll", L"NtUserBuildHwndList");
-    hde->NtUserFindWindowExRVA = (DWORD)api_loader.get_fun(L"user32.dll", L"NtUserFindWindowEx");
+    hdd->NtUserBlockInputVA = user32Loader.GetUserSyscallVa("NtUserBlockInput");
+    hdd->NtUserQueryWindowVA = user32Loader.GetUserSyscallVa("NtUserQueryWindow");
+    hdd->NtUserBuildHwndListVA = user32Loader.GetUserSyscallVa("NtUserBuildHwndList");
+    hdd->NtUserFindWindowExVA = user32Loader.GetUserSyscallVa("NtUserFindWindowEx");
+    hdd->NtUserGetClassNameVA = user32Loader.GetUserSyscallVa("NtUserGetClassName");
+    hdd->NtUserInternalGetWindowTextVA = user32Loader.GetUserSyscallVa("NtUserInternalGetWindowText");
 
-    g_log.LogInfo(L"Loaded RVA for user32.dll!NtUserQueryWindow = 0x%p", hde->NtUserQueryWindowRVA);
-    g_log.LogInfo(L"Loaded RVA for user32.dll!NtUserBuildHwndList = 0x%p", hde->NtUserBuildHwndListRVA);
-    g_log.LogInfo(L"Loaded RVA for user32.dll!NtUserFindWindowEx = 0x%p", hde->NtUserFindWindowExRVA);
-
-    if (!hde->NtUserQueryWindowRVA || !hde->NtUserBuildHwndListRVA || !hde->NtUserFindWindowExRVA)
-    {
-        g_log.LogError(
-            L"NtUser* API Addresses are missing!\n"
-            L"File: %s\n"
-            L"Section: %s\n"
-            L"Please read the documentation to fix this problem!",
-            file, api_loader.GetOsId().c_str()
-        );
-    }
+    g_log.LogInfo(L"Loaded VA for NtUserBlockInput = 0x%p", hdd->NtUserBlockInputVA);
+    g_log.LogInfo(L"Loaded VA for NtUserQueryWindow = 0x%p", hdd->NtUserQueryWindowVA);
+    g_log.LogInfo(L"Loaded VA for NtUserBuildHwndList = 0x%p", hdd->NtUserBuildHwndListVA);
+    g_log.LogInfo(L"Loaded VA for NtUserFindWindowEx = 0x%p", hdd->NtUserFindWindowExVA);
+    g_log.LogInfo(L"Loaded VA for NtUserGetClassName = 0x%p", hdd->NtUserGetClassNameVA);
+    g_log.LogInfo(L"Loaded VA for NtUserInternalGetWindowText = 0x%p", hdd->NtUserInternalGetWindowTextVA);
 }
 
 #ifndef _WIN64
@@ -68,14 +68,16 @@ void __declspec(naked) handleAntiAttach()
     }
 
     //write our RemoteBreakIn patch to target memory
-    RemoteBreakinPatch = (BYTE*)VirtualAllocEx(hDebuggee, 0, sizeof(code), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hDebuggee, (LPVOID)RemoteBreakinPatch, code, sizeof(code), NULL);
+    RemoteBreakinPatch = (BYTE*)VirtualAllocEx(hDebuggee, 0, sizeof(OllyRemoteBreakInReplacement), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(hDebuggee, (LPVOID)RemoteBreakinPatch, OllyRemoteBreakInReplacement, sizeof(OllyRemoteBreakInReplacement), NULL);
 
     //find push ntdll.DbgUiRemoteBreakin and patch our patch function addr there
     while (*(DWORD*)DbgUiIssueRemoteBreakin_addr != DbgUiRemoteBreakin_addr) {
         DbgUiIssueRemoteBreakin_addr++;
     }
     WriteProcessMemory(GetCurrentProcess(), DbgUiIssueRemoteBreakin_addr, &RemoteBreakinPatch, 4, NULL);
+    ULONG oldProtect;
+    VirtualProtectEx(hDebuggee, RemoteBreakinPatch, sizeof(OllyRemoteBreakInReplacement), PAGE_EXECUTE_READ, &oldProtect);
 
     _asm {
         popad
@@ -89,7 +91,6 @@ void InstallAntiAttachHook()
 {
 #ifndef _WIN64
     HANDLE hOlly = GetCurrentProcess();
-    DWORD lpBaseAddr = (DWORD)GetModuleHandle(NULL);
 
     DbgUiIssueRemoteBreakin_addr = (BYTE*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "DbgUiIssueRemoteBreakin");
     DbgUiRemoteBreakin_addr = (DWORD)GetProcAddress(GetModuleHandleA("ntdll.dll"), "DbgUiRemoteBreakin");
@@ -105,7 +106,7 @@ void InstallAntiAttachHook()
     WriteProcessMemory(hOlly, DbgUiIssueRemoteBreakin_addr + 1, &patch, 4, NULL);
 
     //init our remote breakin patch
-    BYTE* p = &code[0];
+    BYTE* p = &OllyRemoteBreakInReplacement[0];
     *p = 0xCC;  //int3
     p++;
     *p = 0x68;  //push
@@ -150,26 +151,42 @@ bool StartHooking(HANDLE hProcess, HOOK_DLL_DATA *hdd, BYTE * dllMemory, DWORD_P
     hdd->EnableProtectProcessId = TRUE;
 
     DWORD peb_flags = 0;
-    if (g_settings.opts().fixPebBeingDebugged) peb_flags |= PEB_PATCH_BeingDebugged;
-    if (g_settings.opts().fixPebHeapFlags) peb_flags |= PEB_PATCH_HeapFlags;
-    if (g_settings.opts().fixPebNtGlobalFlag) peb_flags |= PEB_PATCH_NtGlobalFlag;
-    if (g_settings.opts().fixPebStartupInfo) peb_flags |= PEB_PATCH_ProcessParameters;
+    if (g_settings.opts().fixPebBeingDebugged)
+        peb_flags |= PEB_PATCH_BeingDebugged;
+    if (g_settings.opts().fixPebHeapFlags)
+        peb_flags |= PEB_PATCH_HeapFlags;
+    if (g_settings.opts().fixPebNtGlobalFlag)
+        peb_flags |= PEB_PATCH_NtGlobalFlag;
+    if (g_settings.opts().fixPebStartupInfo)
+        peb_flags |= PEB_PATCH_ProcessParameters;
 
     ApplyPEBPatch(hProcess, peb_flags);
+
+    if (dllMemory == nullptr || imageBase == 0)
+        return peb_flags != 0; // Not injecting hook DLL
 
     return ApplyHook(hdd, hProcess, dllMemory, imageBase);
 }
 
 void startInjectionProcess(HANDLE hProcess, HOOK_DLL_DATA *hdd, BYTE * dllMemory, bool newProcess)
 {
+    if (!NT_SUCCESS(NtSuspendProcess(hProcess)))
+        return;
+
+    const bool injectDll = g_settings.hook_dll_needed() || hdd->isNtdllHooked || hdd->isKernel32Hooked || hdd->isUserDllHooked;
+
     DWORD hookDllDataAddressRva = GetDllFunctionAddressRVA(dllMemory, "HookDllData");
 
-    if (newProcess == false)
+    if (!newProcess)
     {
         //g_log.Log(L"Apply hooks again");
-        if (StartHooking(hProcess, hdd, dllMemory, (DWORD_PTR)remoteImageBase))
+        if (injectDll && StartHooking(hProcess, hdd, dllMemory, (DWORD_PTR)remoteImageBase))
         {
             WriteProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hookDllDataAddressRva + (DWORD_PTR)remoteImageBase), hdd, sizeof(HOOK_DLL_DATA), 0);
+        }
+        else if (!injectDll)
+        {
+            StartHooking(hProcess, hdd, nullptr, 0);
         }
     }
     else
@@ -181,32 +198,41 @@ void startInjectionProcess(HANDLE hProcess, HOOK_DLL_DATA *hdd, BYTE * dllMemory
 
         RestoreHooks(hdd, hProcess);
 
-        remoteImageBase = MapModuleToProcess(hProcess, dllMemory, true);
-        if (remoteImageBase)
+        if (injectDll)
         {
-            FillHookDllData(hProcess, hdd);
-
-            StartHooking(hProcess, hdd, dllMemory, (DWORD_PTR)remoteImageBase);
-
-            if (WriteProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hookDllDataAddressRva + (DWORD_PTR)remoteImageBase), hdd, sizeof(HOOK_DLL_DATA), 0))
+            remoteImageBase = MapModuleToProcess(hProcess, dllMemory, true);
+            if (remoteImageBase)
             {
-                g_log.LogInfo(L"Hook Injection successful, Imagebase %p", remoteImageBase);
+                FillHookDllData(hProcess, hdd);
+
+                if (StartHooking(hProcess, hdd, dllMemory, (DWORD_PTR)remoteImageBase) &&
+                    WriteProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hookDllDataAddressRva + (DWORD_PTR)remoteImageBase), hdd, sizeof(HOOK_DLL_DATA), 0))
+                {
+                    g_log.LogInfo(L"Hook injection successful, image base %p", remoteImageBase);
+                }
+                else
+                {
+                    g_log.LogError(L"Failed to write hook dll data");
+                }
             }
             else
             {
-                g_log.LogError(L"Failed to write hook dll data");
+                g_log.LogError(L"Failed to map image!");
             }
         }
         else
         {
-            g_log.LogError(L"Failed to map image!");
+            if (StartHooking(hProcess, hdd, nullptr, 0))
+                g_log.LogInfo(L"PEB patch successful, hook injection not needed\n");
         }
     }
+
+    NtResumeProcess(hProcess);
 }
 
 void startInjection(DWORD targetPid, HOOK_DLL_DATA *hdd, const WCHAR * dllPath, bool newProcess)
 {
-    HANDLE hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+    HANDLE hProcess = OpenProcess( PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
         0, targetPid);
     if (hProcess)
     {
@@ -482,16 +508,10 @@ BYTE * ReadFileToMemory(const WCHAR * targetFilePath)
 
 void FillHookDllData(HANDLE hProcess, HOOK_DLL_DATA *hdd)
 {
-    hdd->hNtdll = GetModuleBaseRemote(hProcess, L"ntdll.dll");
-    hdd->hkernel32 = GetModuleBaseRemote(hProcess, L"kernel32.dll");
-    hdd->hkernelBase = GetModuleBaseRemote(hProcess, L"kernelbase.dll");
-    hdd->hUser32 = GetModuleBaseRemote(hProcess, L"user32.dll");
-
     hdd->EnablePebBeingDebugged = g_settings.opts().fixPebBeingDebugged;
     hdd->EnablePebHeapFlags = g_settings.opts().fixPebHeapFlags;
     hdd->EnablePebNtGlobalFlag = g_settings.opts().fixPebNtGlobalFlag;
     hdd->EnablePebStartupInfo = g_settings.opts().fixPebStartupInfo;
-    hdd->EnableBlockInputHook = g_settings.opts().hookBlockInput;
     hdd->EnableOutputDebugStringHook = g_settings.opts().hookOutputDebugStringA;
     hdd->EnableNtSetInformationThreadHook = g_settings.opts().hookNtSetInformationThread;
     hdd->EnableNtQueryInformationProcessHook = g_settings.opts().hookNtQueryInformationProcess;
@@ -501,6 +521,7 @@ void FillHookDllData(HANDLE hProcess, HOOK_DLL_DATA *hdd)
     hdd->EnableNtCloseHook = g_settings.opts().hookNtClose;
     hdd->EnableNtCreateThreadExHook = g_settings.opts().hookNtCreateThreadEx;
     hdd->EnablePreventThreadCreation = g_settings.opts().preventThreadCreation;
+    hdd->EnableNtUserBlockInputHook = g_settings.opts().hookNtUserBlockInput;
     hdd->EnableNtUserFindWindowExHook = g_settings.opts().hookNtUserFindWindowEx;
     hdd->EnableNtUserBuildHwndListHook = g_settings.opts().hookNtUserBuildHwndList;
     hdd->EnableNtUserQueryWindowHook = g_settings.opts().hookNtUserQueryWindow;
@@ -521,7 +542,7 @@ void FillHookDllData(HANDLE hProcess, HOOK_DLL_DATA *hdd)
 
     hdd->isKernel32Hooked = FALSE;
     hdd->isNtdllHooked = FALSE;
-    hdd->isUser32Hooked = FALSE;
+    hdd->isUserDllHooked = FALSE;
 }
 
 bool RemoveDebugPrivileges(HANDLE hProcess)

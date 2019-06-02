@@ -2,10 +2,16 @@
 #include <distorm/distorm.h>
 #include <distorm/mnemonics.h>
 #include <Scylla/OsInfo.h>
+#include <Scylla/Settings.h>
 #include "ApplyHooking.h"
 #include <stdio.h>
 
 #pragma comment(lib, "distorm.lib")
+
+// GDT selector numbers on AMD64
+#define KGDT64_R3_CMCODE (2 * 16)   // user mode 32-bit code
+#define KGDT64_R3_CODE (3 * 16)     // user mode 64-bit code
+#define RPL_MASK 3
 
 #if !defined(_WIN64)
 _DecodeType DecodingType = Decode32Bits;
@@ -17,15 +23,19 @@ _DecodeType DecodingType = Decode64Bits;
 const int minDetourLen = 2 + sizeof(DWORD)+sizeof(DWORD_PTR) + 1; //8+4+2+1=15
 #else
 const int minDetourLen = sizeof(DWORD) + 1;
+const int detourLenWow64IndirectJmp = 2 + sizeof(DWORD) + sizeof(DWORD); // FF 25 jmp
+const int detourLenWow64FarJmp = 1 + sizeof(DWORD) + sizeof(USHORT); // EA far jmp
 #endif
 
 
+extern scl::Settings g_settings;
 extern void * HookedNativeCallInternal;
 extern void * NativeCallContinue;
 extern HOOK_NATIVE_CALL32 * HookNative;
 extern int countNativeHooks;
 extern bool onceNativeCallContinue;
 extern bool fatalFindSyscallIndexFailure;
+extern bool fatalAlreadyHookedFailure;
 
 BYTE originalBytes[60] = { 0 };
 BYTE changedBytes[60] = { 0 };
@@ -42,7 +52,6 @@ void WriteJumper(unsigned char * lpbFrom, unsigned char * lpbTo)
     lpbFrom[0] = 0xE9;
     *(DWORD*)&lpbFrom[1] = (DWORD)((DWORD)lpbTo - (DWORD)lpbFrom - 5);
 #endif
-
 }
 
 void WriteJumper(unsigned char * lpbFrom, unsigned char * lpbTo, unsigned char * buf, bool prefixNop)
@@ -64,8 +73,26 @@ void WriteJumper(unsigned char * lpbFrom, unsigned char * lpbTo, unsigned char *
     buf[0] = 0xE9;
     *(DWORD*)&buf[1] = (DWORD)((DWORD)lpbTo - (DWORD)lpbFrom - 5);
 #endif
-
 }
+
+#ifndef _WIN64
+void WriteWow64Jumper(unsigned char * lpbFrom, unsigned char * lpbTo, unsigned char * buf, bool farJmp)
+{
+    if (!farJmp)
+    {
+        // Preserve FF 25 prefix (absolute indirect far jmp) at the cost of wasted bytes
+        buf[0] = 0xFF;
+        buf[1] = 0x25;
+        *(DWORD*)&buf[2] = (DWORD)((DWORD)lpbFrom + 6); // +instruction length
+        *(DWORD*)&buf[6] = (DWORD)lpbTo;
+    }
+
+    // Preserve EA prefix (absolute far jmp), but use the 32 bit segment selector to avoid transitioning into x64 mode
+    buf[0] = 0xEA;
+    *(DWORD*)&buf[1] = (DWORD)lpbTo;
+    *(USHORT*)&buf[5] = (USHORT)(KGDT64_R3_CMCODE | RPL_MASK);
+}
+#endif
 
 void ClearSyscallBreakpoint(const char* funcName, unsigned char* funcBytes)
 {
@@ -310,6 +337,7 @@ void * DetourCreateRemoteNativeSysWow64(void * hProcess, void * lpFuncOrig, void
 {
     PBYTE trampoline = 0;
     DWORD protect;
+    bool detouringFarJmp = true; // TODO: we should always find and hook the true (non-indirect) far jmp into x64 mode. ('jmp Wow64Transition' will also lead to a far jmp eventually)
     bool onceNativeCallContinueWasSet = onceNativeCallContinue;
     onceNativeCallContinue = true;
 
@@ -391,12 +419,23 @@ void * DetourCreateRemoteNativeSysWow64(void * hProcess, void * lpFuncOrig, void
     {
         if (ReadProcessMemory(hProcess, (void*)sysWowSpecialJmpAddress, sysWowSpecialJmp, sizeof(sysWowSpecialJmp), 0))
         {
+            detouringFarJmp = sysWowSpecialJmp[0] == 0xEA &&
+                (sysWowSpecialJmp[5] == (KGDT64_R3_CODE | RPL_MASK) || sysWowSpecialJmp[5] == (KGDT64_R3_CMCODE | RPL_MASK));
+
+            if (sysWowSpecialJmp[0] == 0xE9 || (detouringFarJmp && sysWowSpecialJmp[5] == (KGDT64_R3_CMCODE | RPL_MASK)))
+            {
+                fatalAlreadyHookedFailure = true;
+                MessageBoxA(nullptr, "Function is already hooked!", "ScyllaHide", MB_ICONERROR);
+                return nullptr;
+            }
+
             NativeCallContinue = VirtualAllocEx(hProcess, 0, sizeof(sysWowSpecialJmp), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
             if (!WriteProcessMemory(hProcess, NativeCallContinue, sysWowSpecialJmp, sizeof(sysWowSpecialJmp), 0))
             {
                 MessageBoxA(nullptr, "Failed to write NativeCallContinue routine", "Error", MB_ICONERROR);
                 return nullptr;
             }
+            VirtualProtectEx(hProcess, NativeCallContinue, sizeof(sysWowSpecialJmp), PAGE_EXECUTE_READ, &protect);
         }
         else
         {
@@ -418,20 +457,23 @@ void * DetourCreateRemoteNativeSysWow64(void * hProcess, void * lpFuncOrig, void
         memcpy(changedBytes + callOffset + 5 + sizeof(sysWowSpecialJmp), originalBytes + callOffset + callSize, funcSize - callOffset - callSize);
 
         WriteProcessMemory(hProcess, trampoline, changedBytes, sizeof(changedBytes), 0);
+        VirtualProtectEx(hProcess, trampoline, sizeof(changedBytes), PAGE_EXECUTE_READ, &protect);
     }
 
     if (!onceNativeCallContinueWasSet)
     {
-        if (VirtualProtectEx(hProcess, (void *)sysWowSpecialJmpAddress, minDetourLen, PAGE_EXECUTE_READWRITE, &protect))
+        const int detourLen = detouringFarJmp ? detourLenWow64FarJmp : detourLenWow64IndirectJmp;
+        if (VirtualProtectEx(hProcess, (void *)sysWowSpecialJmpAddress, detourLen, PAGE_EXECUTE_READWRITE, &protect))
         {
             ZeroMemory(tempSpace, sizeof(tempSpace));
-            WriteJumper((PBYTE)sysWowSpecialJmpAddress, (PBYTE)HookedNativeCallInternal, tempSpace, false);
-            if (!WriteProcessMemory(hProcess, (void *)sysWowSpecialJmpAddress, tempSpace, minDetourLen, 0))
+            // Write a faux WOW64 transition far jmp with disregard for space used
+            WriteWow64Jumper((PBYTE)sysWowSpecialJmpAddress, (PBYTE)HookedNativeCallInternal, tempSpace, detouringFarJmp);
+            if (!WriteProcessMemory(hProcess, (void *)sysWowSpecialJmpAddress, tempSpace, detourLen, 0))
             {
                 MessageBoxA(0, "Failed to write new WOW64 gateway", "Error", MB_ICONERROR);
             }
 
-            VirtualProtectEx(hProcess, (void *)sysWowSpecialJmpAddress, minDetourLen, protect, &protect);
+            VirtualProtectEx(hProcess, (void *)sysWowSpecialJmpAddress, detourLen, protect, &protect);
         }
         else
         {
@@ -470,6 +512,7 @@ void * DetourCreateRemoteNative32Normal(void * hProcess, const char* funcName, v
             if (NativeCallContinue)
             {
                 WriteProcessMemory(hProcess, NativeCallContinue, KiSystemCallBackup, KiSystemCallBackupSize, 0);
+                VirtualProtectEx(hProcess, NativeCallContinue, sizeof(KiSystemCallBackupSize), PAGE_EXECUTE_READ, &protect);
             }
             else
             {
@@ -495,6 +538,7 @@ void * DetourCreateRemoteNative32Normal(void * hProcess, const char* funcName, v
         memcpy(changedBytes + callOffset + 5 + KiSystemCallBackupSize, originalBytes + callOffset + callSize, funcSize - callOffset - callSize);
 
         WriteProcessMemory(hProcess, trampoline, changedBytes, sizeof(changedBytes), 0);
+        VirtualProtectEx(hProcess, trampoline, sizeof(changedBytes), PAGE_EXECUTE_READ, &protect);
     }
 
     if (onceNativeCallContinue == false)
@@ -516,13 +560,24 @@ void * DetourCreateRemoteNative32Normal(void * hProcess, const char* funcName, v
 
 void * DetourCreateRemoteNative32(void * hProcess, const char* funcName, void * lpFuncOrig, void * lpFuncDetour, bool createTramp, unsigned long * backupSize)
 {
-    if (scl::GetWindowsVersion() >= scl::OS_WIN_8 && !scl::IsWow64Process(hProcess))
+    if (!scl::IsWow64Process(hProcess))
     {
-        // The native x86 syscall structure was changed in Windows 8. https://github.com/x64dbg/ScyllaHide/issues/49
-        return DetourCreateRemote(hProcess, funcName, lpFuncOrig, lpFuncDetour, createTramp, backupSize);
+        // Handle special cases on native x86 where hooks should be placed inside the function and not at KiFastSystemCall.
+        // TODO: why does DetourCreateRemoteNative32Normal even exist? DetourCreateRemote works fine on any OS
+        if (scl::GetWindowsVersion() >= scl::OS_WIN_8)
+        {
+            // The native x86 syscall structure was changed in Windows 8. https://github.com/x64dbg/ScyllaHide/issues/49
+            return DetourCreateRemote(hProcess, funcName, lpFuncOrig, lpFuncDetour, createTramp, backupSize);
+        }
+
+        if (g_settings.profile_name().find(L"Obsidium") != std::wstring::npos)
+        {
+            // This is an extremely lame hack because Obsidium doesn't like where we put our hooks
+            return DetourCreateRemote(hProcess, funcName, lpFuncOrig, lpFuncDetour, createTramp, backupSize);
+        }
     }
 
-    if (fatalFindSyscallIndexFailure)
+    if (fatalFindSyscallIndexFailure || fatalAlreadyHookedFailure)
         return nullptr; // Don't spam user with repeated error message boxes
 
     memset(changedBytes, 0x90, sizeof(changedBytes));
@@ -582,6 +637,9 @@ void * DetourCreateRemote(void * hProcess, const char* funcName, void * lpFuncOr
 
     bool success = false;
 
+    if (fatalFindSyscallIndexFailure || fatalAlreadyHookedFailure)
+        return nullptr; // Don't spam user with repeated error message boxes
+
     if (!ReadProcessMemory(hProcess, lpFuncOrig, originalBytes, sizeof(originalBytes), nullptr))
     {
         MessageBoxA(nullptr, "DetourCreateRemote->ReadProcessMemory failed.", "ScyllaHide", MB_ICONERROR);
@@ -589,6 +647,24 @@ void * DetourCreateRemote(void * hProcess, const char* funcName, void * lpFuncOr
     }
 
     ClearSyscallBreakpoint(funcName, originalBytes);
+
+    // Note that this check will give a false negative in the case that a function is hooked *and* has a breakpoint set on it (now cleared).
+    // We can clear the breakpoint or detect the hook, not both. (If the hook is ours, this is actually a hack because we should be properly unhooking)
+#ifdef _WIN64
+    const bool isHooked = (originalBytes[0] == 0xFF && originalBytes[1] == 0x25) ||
+        (originalBytes[0] == 0x90 && originalBytes[1] == 0xFF && originalBytes[2] == 0x25);
+#else
+    const bool isHooked = originalBytes[0] == 0xE9;
+#endif
+    if (isHooked)
+    {
+        fatalAlreadyHookedFailure = true;
+        char errorMessage[256];
+        _snprintf_s(errorMessage, sizeof(errorMessage), sizeof(errorMessage) - sizeof(char),
+            "Error: %hs is already hooked!", funcName);
+        MessageBoxA(nullptr, errorMessage, "ScyllaHide", MB_ICONERROR);
+        return nullptr;
+    }
 
     int detourLen = GetDetourLen(originalBytes, minDetourLen);
 
@@ -605,6 +681,7 @@ void * DetourCreateRemote(void * hProcess, const char* funcName, void * lpFuncOr
         ZeroMemory(tempSpace, sizeof(tempSpace));
         WriteJumper(trampoline + detourLen, (PBYTE)lpFuncOrig + detourLen, tempSpace, false);
         WriteProcessMemory(hProcess, trampoline + detourLen, tempSpace, minDetourLen, 0);
+        VirtualProtectEx(hProcess, trampoline, detourLen + minDetourLen, PAGE_EXECUTE_READ, &protect);
     }
 
     if (VirtualProtectEx(hProcess, lpFuncOrig, detourLen, PAGE_EXECUTE_READWRITE, &protect))
@@ -649,6 +726,7 @@ void * DetourCreate(void * lpFuncOrig, void * lpFuncDetour, bool createTramp)
 
         memcpy(trampoline, lpFuncOrig, detourLen);
         WriteJumper(trampoline + detourLen, (PBYTE)lpFuncOrig + detourLen);
+        VirtualProtect(trampoline, detourLen + minDetourLen, PAGE_EXECUTE_READ, &protect);
     }
 
 

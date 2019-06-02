@@ -494,30 +494,28 @@ NTSTATUS NTAPI HookedNtContinue(PCONTEXT ThreadContext, BOOLEAN RaiseAlert) //re
     DWORD_PTR retAddress = (DWORD_PTR)_ReturnAddress();
     if (!KiUserExceptionDispatcherAddress)
     {
-        ANSI_STRING KiUserExceptionDispatcherName = RTL_CONSTANT_ANSI_STRING("KiUserExceptionDispatcher");
-        LdrGetProcedureAddress(HookDllData.hNtdll, &KiUserExceptionDispatcherName, 0, (PVOID*)&KiUserExceptionDispatcherAddress);
+        UNICODE_STRING NtdllName = RTL_CONSTANT_STRING(L"ntdll.dll");
+        PVOID Ntdll;
+        if (NT_SUCCESS(LdrGetDllHandle(nullptr, nullptr, &NtdllName, &Ntdll)))
+        {
+            ANSI_STRING KiUserExceptionDispatcherName = RTL_CONSTANT_ANSI_STRING("KiUserExceptionDispatcher");
+            LdrGetProcedureAddress(Ntdll, &KiUserExceptionDispatcherName, 0, (PVOID*)&KiUserExceptionDispatcherAddress);
+        }
     }
 
-    if (ThreadContext)
+    if (ThreadContext != nullptr &&
+        retAddress >= KiUserExceptionDispatcherAddress && retAddress < (KiUserExceptionDispatcherAddress + 0x100))
     {
-        //char text[100];
-        //wsprintfA(text, "HookedNtContinue return %X", _ReturnAddress());
-        //MessageBoxA(0, text, "debug", 0);
-
-        if (retAddress >= KiUserExceptionDispatcherAddress && retAddress < (KiUserExceptionDispatcherAddress + 0x100))
+        int index = ThreadDebugContextFindExistingSlotIndex();
+        if (index != -1)
         {
-            int index = ThreadDebugContextFindExistingSlotIndex();
-            if (index != -1)
-            {
-                ThreadContext->Dr0 = ArrayDebugRegister[index].Dr0;
-                ThreadContext->Dr1 = ArrayDebugRegister[index].Dr1;
-                ThreadContext->Dr2 = ArrayDebugRegister[index].Dr2;
-                ThreadContext->Dr3 = ArrayDebugRegister[index].Dr3;
-                ThreadContext->Dr6 = ArrayDebugRegister[index].Dr6;
-                ThreadContext->Dr7 = ArrayDebugRegister[index].Dr7;
-                ThreadDebugContextRemoveEntry(index);
-            }
-
+            ThreadContext->Dr0 = ArrayDebugRegister[index].Dr0;
+            ThreadContext->Dr1 = ArrayDebugRegister[index].Dr1;
+            ThreadContext->Dr2 = ArrayDebugRegister[index].Dr2;
+            ThreadContext->Dr3 = ArrayDebugRegister[index].Dr3;
+            ThreadContext->Dr6 = ArrayDebugRegister[index].Dr6;
+            ThreadContext->Dr7 = ArrayDebugRegister[index].Dr7;
+            ThreadDebugContextRemoveEntry(index);
         }
     }
 
@@ -780,7 +778,7 @@ NTSTATUS NTAPI HookedNtQueryPerformanceCounter(PLARGE_INTEGER PerformanceCounter
 
 static BOOL isBlocked = FALSE;
 
-BOOL WINAPI HookedBlockInput(BOOL fBlockIt)
+BOOL NTAPI HookedNtUserBlockInput(BOOL fBlockIt)
 {
     if (isBlocked == FALSE && fBlockIt != FALSE)
     {
@@ -794,11 +792,6 @@ BOOL WINAPI HookedBlockInput(BOOL fBlockIt)
     }
 
     return FALSE;
-}
-
-NTSTATUS NTAPI HookedNtUserBlockInput(BOOL fBlockIt)
-{
-    return (NTSTATUS)HookedBlockInput(fBlockIt);
 }
 
 //GetLastError() function might not change if a  debugger is present (it has never been the case that it is always set to zero).
@@ -847,53 +840,51 @@ NTSTATUS NTAPI HookedNtSetDebugFilterState(ULONG ComponentId, ULONG Level, BOOLE
     return HasDebugPrivileges(NtCurrentProcess) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
 }
 
-void FilterHwndList(HWND * phwndFirst, PUINT pcHwndNeeded)
+void FilterHwndList(HWND * phwndFirst, PULONG pcHwndNeeded)
 {
-    if (!HookDllData.EnableProtectProcessId)
-        return;
-
     for (UINT i = 0; i < *pcHwndNeeded; i++)
     {
-        if (phwndFirst[i] != nullptr)
+        if (phwndFirst[i] != nullptr && IsWindowBad(phwndFirst[i]))
         {
-            //GetWindowThreadProcessId(phwndFirst[i], &dwProcessId);
-            ULONG dwProcessId = HookDllData.dNtUserQueryWindow != nullptr
-                ? HandleToULong(HookDllData.dNtUserQueryWindow(phwndFirst[i], WindowProcess))
-                : HandleToULong(HookDllData.NtUserQueryWindow(phwndFirst[i], WindowProcess));
-
-            if (dwProcessId == HookDllData.dwProtectedProcessId)
+            if (i == 0)
             {
-                if (i == 0)
+                // Find the first HWND that belongs to a different process (i + 1, i + 2... may still be ours)
+                for (UINT j = i + 1; j < *pcHwndNeeded; j++)
                 {
-                    // Find the first HWND that belongs to a different process (i + 1, i + 2... may still be ours)
-                    for (UINT j = i + 1; j < *pcHwndNeeded; j++)
+                    if (phwndFirst[j] != nullptr && !IsWindowBad(phwndFirst[j]))
                     {
-                        dwProcessId = HookDllData.dNtUserQueryWindow != nullptr
-                            ? HandleToULong(HookDllData.dNtUserQueryWindow(phwndFirst[j], WindowProcess))
-                            : HandleToULong(HookDllData.NtUserQueryWindow(phwndFirst[j], WindowProcess));
-                        if (dwProcessId != HookDllData.dwProtectedProcessId)
-                        {
-                            phwndFirst[i] = phwndFirst[j];
-                            break;
-                        }
+                        phwndFirst[i] = phwndFirst[j];
+                        break;
                     }
                 }
-                else
-                {
-                    phwndFirst[i] = phwndFirst[i - 1]; //just override with previous
-                }
+            }
+            else
+            {
+                phwndFirst[i] = phwndFirst[i - 1]; //just override with previous
             }
         }
     }
 }
 
-NTSTATUS NTAPI HookedNtUserBuildHwndList(HDESK hdesk, HWND hwndNext, BOOL fEnumChildren, DWORD idThread, UINT cHwndMax, HWND *phwndFirst, PUINT pcHwndNeeded)
+NTSTATUS NTAPI HookedNtUserBuildHwndList(HDESK hDesktop, HWND hwndParent, BOOLEAN bChildren, ULONG dwThreadId, ULONG lParam, HWND* pWnd, PULONG pBufSize)
 {
-    NTSTATUS ntStat = HookDllData.dNtUserBuildHwndList(hdesk, hwndNext, fEnumChildren, idThread, cHwndMax, phwndFirst, pcHwndNeeded);
+    NTSTATUS ntStat = HookDllData.dNtUserBuildHwndList(hDesktop, hwndParent, bChildren, dwThreadId, lParam, pWnd, pBufSize);
 
-    if (NT_SUCCESS(ntStat) && pcHwndNeeded != 0 && phwndFirst != 0)
+    if (NT_SUCCESS(ntStat) && pWnd != nullptr && pBufSize != nullptr)
     {
-        FilterHwndList(phwndFirst, pcHwndNeeded);
+        FilterHwndList(pWnd, pBufSize);
+    }
+
+    return ntStat;
+}
+
+NTSTATUS NTAPI HookedNtUserBuildHwndList_Eight(HDESK hDesktop, HWND hwndParent, BOOLEAN bChildren, BOOLEAN bUnknownFlag, ULONG dwThreadId, ULONG lParam, HWND* pWnd, PULONG pBufSize)
+{
+    NTSTATUS ntStat = ((t_NtUserBuildHwndList_Eight)HookDllData.dNtUserBuildHwndList)(hDesktop, hwndParent, bChildren, bUnknownFlag, dwThreadId, lParam, pWnd, pBufSize);
+
+    if (NT_SUCCESS(ntStat) && pWnd != nullptr && pBufSize != nullptr)
+    {
+        FilterHwndList(pWnd, pBufSize);
     }
 
     return ntStat;
@@ -901,20 +892,14 @@ NTSTATUS NTAPI HookedNtUserBuildHwndList(HDESK hdesk, HWND hwndNext, BOOL fEnumC
 
 HANDLE NTAPI HookedNtUserQueryWindow(HWND hwnd, WINDOWINFOCLASS WindowInfo)
 {
-	HANDLE hHandle = HookDllData.dNtUserQueryWindow(hwnd, WindowInfo);
-
-	if (hHandle)
+	if ((WindowInfo == WindowProcess || WindowInfo == WindowThread) && IsWindowBad(hwnd))
 	{
-		if(HookDllData.EnableProtectProcessId == TRUE)
-		{
-			if (hHandle == ULongToHandle(HookDllData.dwProtectedProcessId))
-			{
-				return (HANDLE)((DWORD_PTR)hHandle + 1);
-			}
-		}
+		if (WindowInfo == WindowProcess)
+			return NtCurrentTeb()->ClientId.UniqueProcess;
+		if (WindowInfo == WindowThread)
+			return NtCurrentTeb()->ClientId.UniqueThread;
 	}
-
-	return hHandle;
+	return HookDllData.dNtUserQueryWindow(hwnd, WindowInfo);
 }
 
 //WIN XP: CreateThread -> CreateRemoteThread -> NtCreateThread

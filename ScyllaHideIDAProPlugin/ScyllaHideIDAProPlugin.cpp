@@ -5,20 +5,19 @@
 //for 64bit - p64
 #ifdef BUILD_IDA_64BIT
 #define __EA64__
-#pragma comment(lib, "idasdk/x86_win_vc_64/ida.lib")
+#pragma comment(lib, "x86_win_vc_64/ida.lib")
 #else
 //for 32bit - plw
-#pragma comment(lib, "idasdk/x86_win_vc_32/ida.lib")
+#pragma comment(lib, "x86_win_vc_32/ida.lib")
 #endif
 
 #include <Windows.h>
-#include <idasdk/ida.hpp>
-#include <idasdk/idp.hpp>
-#include <idasdk/dbg.hpp>
-#include <idasdk/loader.hpp>
-#include <idasdk/kernwin.hpp>
+#include <ida.hpp>
+#include <idp.hpp>
+#include <dbg.hpp>
+#include <loader.hpp>
+#include <kernwin.hpp>
 #include <Scylla/Logger.h>
-#include <Scylla/NtApiLoader.h>
 #include <Scylla/Settings.h>
 #include <Scylla/Version.h>
 #include <Scylla/Util.h>
@@ -39,7 +38,6 @@ const WCHAR g_scyllaHidex64ServerFilename[] = L"ScyllaHideIDAServerx64.exe";
 scl::Settings g_settings;
 scl::Logger g_log;
 std::wstring g_scyllaHideDllPath;
-std::wstring g_ntApiCollectionIniPath;
 std::wstring g_scyllaHideIniPath;
 std::wstring g_scyllaHidex64ServerPath;
 
@@ -359,7 +357,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDll, DWORD dwReason, LPVOID lpReserved)
         wstrPath.resize(wstrPath.find_last_of(L'\\') + 1);
 
         g_scyllaHideDllPath = wstrPath + g_scyllaHideDllFilename;
-        g_ntApiCollectionIniPath = wstrPath + scl::NtApiLoader::kFileName;
         g_scyllaHideIniPath = wstrPath + scl::Settings::kFileName;
         g_scyllaHidex64ServerPath = wstrPath + g_scyllaHidex64ServerFilename;
 

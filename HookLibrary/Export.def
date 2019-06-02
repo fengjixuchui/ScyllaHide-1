@@ -1,7 +1,6 @@
 LIBRARY
 EXPORTS
 HookDllData
-HookedBlockInput
 HookedGetLocalTime
 HookedGetSystemTime
 HookedGetTickCount
@@ -25,6 +24,7 @@ HookedNtSetInformationProcess
 HookedNtSetInformationThread
 HookedNtUserBlockInput
 HookedNtUserBuildHwndList
+HookedNtUserBuildHwndList_Eight
 HookedNtUserFindWindowEx
 HookedNtUserQueryWindow
 HookedNtYieldExecution

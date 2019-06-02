@@ -12,7 +12,6 @@ typedef ULONGLONG(WINAPI * t_GetTickCount64)(void);
 typedef BOOL(WINAPI * t_QueryPerformanceCounter)(LARGE_INTEGER *lpPerformanceCount); //Kernel32.dll -> ntdll.RtlQueryPerformanceCounter -> NO NATIVE CALL
 typedef BOOL(WINAPI * t_QueryPerformanceFrequency)(LARGE_INTEGER *lpFrequency); //kernel32.dll -> ntdll.RtlQueryPerformanceFrequency -> ntdll.ZwQueryPerformanceCounter
 
-typedef BOOL(WINAPI * t_BlockInput)(BOOL fBlockIt); //user32.dll
 typedef DWORD(WINAPI * t_OutputDebugStringA)(LPCSTR lpOutputString); //Kernel32.dll
 typedef DWORD(WINAPI * t_OutputDebugStringW)(LPCWSTR lpOutputString); //Kernel32.dll
 //WIN 7 X64: OutputDebugStringW -> OutputDebugStringA
@@ -28,17 +27,12 @@ typedef struct _HOOK_NATIVE_CALL32 {
 
 typedef struct _HOOK_DLL_DATA {
     HMODULE hDllImage;
-    HMODULE hNtdll;
-    HMODULE hkernel32;
-    HMODULE hkernelBase;
-    HMODULE hUser32;
 
     BOOLEAN EnablePebBeingDebugged;
     BOOLEAN EnablePebHeapFlags;
     BOOLEAN EnablePebNtGlobalFlag;
     BOOLEAN EnablePebStartupInfo;
 
-    BOOLEAN EnableBlockInputHook;
     BOOLEAN EnableOutputDebugStringHook;
 
     BOOLEAN EnableNtSetInformationThreadHook;
@@ -58,11 +52,15 @@ typedef struct _HOOK_DLL_DATA {
     BOOLEAN EnableNtContinueHook;
     BOOLEAN EnableKiUserExceptionDispatcherHook;
 
-    //Native User32.dll functions, not exported
-    DWORD NtUserQueryWindowRVA;
-    DWORD NtUserBuildHwndListRVA;
-    DWORD NtUserFindWindowExRVA;
+    //Native user32.dll/win32u.dll functions
+    ULONG_PTR NtUserBlockInputVA;
+    ULONG_PTR NtUserQueryWindowVA;
+    ULONG_PTR NtUserBuildHwndListVA;
+    ULONG_PTR NtUserFindWindowExVA;
+    ULONG_PTR NtUserGetClassNameVA;
+    ULONG_PTR NtUserInternalGetWindowTextVA;
 
+    BOOLEAN EnableNtUserBlockInputHook;
     BOOLEAN EnableNtUserQueryWindowHook;
     BOOLEAN EnableNtUserBuildHwndListHook;
     BOOLEAN EnableNtUserFindWindowExHook;
@@ -134,21 +132,20 @@ typedef struct _HOOK_DLL_DATA {
 
     t_OutputDebugStringA dOutputDebugStringA;
     DWORD OutputDebugStringABackupSize;
-    t_BlockInput dBlockInput;
-    DWORD BlockInputBackupSize;
 
     t_NtUserBlockInput dNtUserBlockInput;
     DWORD NtUserBlockInputBackupSize;
     t_NtUserFindWindowEx dNtUserFindWindowEx;
     DWORD NtUserFindWindowExBackupSize;
-    t_NtUserBuildHwndList dNtUserBuildHwndList;
+    t_NtUserBuildHwndList /*or t_NtUserBuildHwndList_Eight*/ dNtUserBuildHwndList;
     DWORD NtUserBuildHwndListBackupSize;
     t_NtUserQueryWindow dNtUserQueryWindow;
     DWORD NtUserQueryWindowBackupSize;
 
 
     t_NtUserQueryWindow NtUserQueryWindow;
-    //t_NtUserGetClassName dNtUserGetClassName;
+    t_NtUserGetClassName NtUserGetClassName;
+    t_NtUserInternalGetWindowText NtUserInternalGetWindowText;
 
     DWORD dwProtectedProcessId;
     BOOLEAN EnableProtectProcessId;
@@ -156,8 +153,7 @@ typedef struct _HOOK_DLL_DATA {
 
     BOOLEAN isNtdllHooked;
     BOOLEAN isKernel32Hooked;
-    BOOLEAN isUser32Hooked;
-    BOOLEAN isWin32uHooked;
+    BOOLEAN isUserDllHooked;
 
 #ifndef _WIN64
     HOOK_NATIVE_CALL32 HookNative[MAX_NATIVE_HOOKS];
