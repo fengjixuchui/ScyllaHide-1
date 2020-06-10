@@ -9,6 +9,7 @@ HOOK_DLL_DATA HookDllData = { 0 };
 #include "Tls.h"
 
 void FakeCurrentParentProcessId(PSYSTEM_PROCESS_INFORMATION pInfo);
+void FakeCurrentOtherOperationCount(PSYSTEM_PROCESS_INFORMATION pInfo);
 void FilterHandleInfo(PSYSTEM_HANDLE_INFORMATION pHandleInfo, PULONG pReturnLengthAdjust);
 void FilterHandleInfoEx(PSYSTEM_HANDLE_INFORMATION_EX pHandleInfoEx, PULONG pReturnLengthAdjust);
 void FilterProcess(PSYSTEM_PROCESS_INFORMATION pInfo);
@@ -102,6 +103,7 @@ NTSTATUS NTAPI HookedNtQuerySystemInformation(SYSTEM_INFORMATION_CLASS SystemInf
 
                 FilterProcess(ProcessInfo);
                 FakeCurrentParentProcessId(ProcessInfo);
+                FakeCurrentOtherOperationCount(ProcessInfo);
 
                 RESTORE_RETURNLENGTH();
             }
@@ -231,7 +233,8 @@ NTSTATUS NTAPI HookedNtQueryInformationProcess(HANDLE ProcessHandle, PROCESSINFO
         ProcessInformationClass == ProcessDebugPort ||
         ProcessInformationClass == ProcessBasicInformation ||
         ProcessInformationClass == ProcessBreakOnTermination ||
-        ProcessInformationClass == ProcessHandleTracing) &&
+        ProcessInformationClass == ProcessHandleTracing ||
+        ProcessInformationClass == ProcessIoCounters) &&
         (ProcessHandle == NtCurrentProcess || HandleToULong(NtCurrentTeb()->ClientId.UniqueProcess) == GetProcessIdByProcessHandle(ProcessHandle)))
     {
         Status = HookDllData.dNtQueryInformationProcess(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength, ReturnLength);
@@ -277,6 +280,14 @@ NTSTATUS NTAPI HookedNtQueryInformationProcess(HANDLE ProcessHandle, PROCESSINFO
 
                 Status = IsProcessHandleTracingEnabled ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
 			}
+            else if (ProcessInformationClass == ProcessIoCounters)
+            {
+                BACKUP_RETURNLENGTH();
+
+                ((PIO_COUNTERS)ProcessInformation)->OtherOperationCount = 1;
+
+                RESTORE_RETURNLENGTH();
+            }
         }
 
         return Status;
@@ -487,12 +498,26 @@ void NTAPI HandleKiUserExceptionDispatcher(PEXCEPTION_RECORD pExcptRec, PCONTEXT
         ContextFrame->Dr7 = 0;
     }
 }
+#ifdef _WIN64
+void NTAPI HookedKiUserExceptionDispatcher()
+{
+    // inline assembly is not supported in x86_64 with CL.  a more elegant
+    // way to do this would be to modify the project to include an .asm
+    // source file that defines 'HookedKiUserExceptionDispatcher' for both
+    // 32 and 64 bit.
+    // the + 8 in the line below is because we arrive at this function via
+    // a CALL instruction which causes the stack to shift.  This CALL in
+    // the trampoline is necessary because HandleKiUserExceptionDispatcher
+    // will end in a RET instruction, and the CALL preserves the stack.
+    PCONTEXT ContextFrame = (PCONTEXT)(((UINT_PTR)_AddressOfReturnAddress()) + 8);
 
+    HandleKiUserExceptionDispatcher(nullptr, ContextFrame);
+}
+#else
 VOID NAKED NTAPI HookedKiUserExceptionDispatcher()// (PEXCEPTION_RECORD pExcptRec, PCONTEXT ContextFrame) //remove DRx Registers
 {
     //MOV ECX,DWORD PTR SS:[ESP+4] <- ContextFrame
     //MOV EBX,DWORD PTR SS:[ESP] <- pExcptRec
-#ifndef _WIN64
     __asm
     {
         MOV EAX, [ESP + 4]
@@ -502,10 +527,10 @@ VOID NAKED NTAPI HookedKiUserExceptionDispatcher()// (PEXCEPTION_RECORD pExcptRe
         CALL HandleKiUserExceptionDispatcher
         jmp HookDllData.dKiUserExceptionDispatcher
     }
-#endif
 
     //return HookDllData.dKiUserExceptionDispatcher(pExcptRec, ContextFrame);
 }
+#endif
 
 static DWORD_PTR KiUserExceptionDispatcherAddress = 0;
 
@@ -1027,6 +1052,25 @@ void FakeCurrentParentProcessId(PSYSTEM_PROCESS_INFORMATION pInfo)
         if (pInfo->UniqueProcessId == NtCurrentTeb()->ClientId.UniqueProcess)
         {
             pInfo->InheritedFromUniqueProcessId = ULongToHandle(GetExplorerProcessId());
+            break;
+        }
+
+        if (pInfo->NextEntryOffset == 0)
+            break;
+
+        pInfo = (PSYSTEM_PROCESS_INFORMATION)((DWORD_PTR)pInfo + pInfo->NextEntryOffset);
+    }
+}
+
+void FakeCurrentOtherOperationCount(PSYSTEM_PROCESS_INFORMATION pInfo)
+{
+    while (true)
+    {
+        if (pInfo->UniqueProcessId == NtCurrentTeb()->ClientId.UniqueProcess)
+        {
+            LARGE_INTEGER one;
+            one.QuadPart = 1;
+            pInfo->OtherOperationCount = one;
             break;
         }
 
